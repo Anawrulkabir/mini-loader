@@ -2,7 +2,7 @@
 
 A from-scratch PE loader: it opens a 64-bit Windows `.exe`, maps it into
 memory, resolves its imports to your own functions, and runs it — without
-Windows. This is the core mechanism behind Wine and CrossOver, in ~350
+Windows. This is the core mechanism behind Wine and CrossOver, in ~600
 lines you can read in one sitting.
 
 ## Files
@@ -12,6 +12,8 @@ src/pe.h        PE/COFF structures (only the fields we use)
 src/pe_parse.c  step 1 — parse & validate headers, sections, imports
 src/loader.c    step 2 — map, relocate, bind imports, jump to entry
 test/hello.c    a freestanding Windows .exe (no C runtime)
+test/reloc.c    same, but with absolute pointers (exercises .reloc)
+test/check.sh   runs both, plus a set of deliberately malformed .exes
 Makefile
 ```
 
@@ -27,6 +29,13 @@ Expected tail of output:
 == jumping to entry 0x... ==
 
 hello from inside the mini-loader
+```
+
+Run the tests (the two sample programs, then malformed images that
+must be rejected with an error rather than a crash or hang):
+
+```sh
+make test
 ```
 
 Inspect any `.exe` without running it:
@@ -49,6 +58,12 @@ imports from DLLs like `kernel32`. The loader:
    stub into the Import Address Table slot the code calls through.
 5. **Sets page permissions** per section (`.text` r-x, `.data` rw-).
 6. **Jumps** to the entry point.
+
+Every offset, size and RVA in a PE comes from the file, so both the
+parser and the loader bounds-check them before use. A truncated or
+corrupt `.exe` gets an error message, not a segfault. If an import has
+no stub, the loader lists every missing name and refuses to run,
+rather than binding it to NULL and crashing on the first call.
 
 The one non-obvious detail: our stubs are marked `ms_abi`, because
 Windows x64 passes arguments in `RCX, RDX, R8, R9` while the System V

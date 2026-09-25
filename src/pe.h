@@ -32,6 +32,8 @@ typedef struct {
     uint16_t Characteristics;
 } CoffHeader;
 
+#define FILE_RELOCS_STRIPPED 0x0001  /* CoffHeader.Characteristics */
+
 /* One entry in the data directory (imports, relocations, etc.). */
 typedef struct {
     uint32_t VirtualAddress;       /* RVA */

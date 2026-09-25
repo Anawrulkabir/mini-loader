@@ -17,19 +17,36 @@ typedef struct {
     SectionHeader *sections;  /* array of coff->NumberOfSections */
 } PEFile;
 
+/* True if [off, off+len) lies inside the file. Every offset we read
+ * from the headers is attacker-controlled, so check before touching. */
+static int in_file(PEFile *pe, uint64_t off, uint64_t len) {
+    return off <= pe->size && len <= pe->size - off;
+}
+
 /* Convert an RVA (address relative to ImageBase) into a pointer into
  * our raw file buffer, by finding which section contains it. Returns
- * NULL if the RVA falls outside every section. */
-static uint8_t *rva_to_ptr(PEFile *pe, uint32_t rva) {
+ * NULL unless all `len` bytes at that RVA lie inside the section's raw
+ * data (and so, since pe_open checked the sections, inside the file). */
+static uint8_t *rva_to_ptr(PEFile *pe, uint32_t rva, uint32_t len) {
     for (int i = 0; i < pe->coff->NumberOfSections; i++) {
         SectionHeader *s = &pe->sections[i];
         uint32_t start = s->VirtualAddress;
-        uint32_t end   = start + s->SizeOfRawData;
+        uint64_t end   = (uint64_t)start + s->SizeOfRawData;
         if (rva >= start && rva < end) {
+            if ((uint64_t)rva + len > end) return NULL;
             return pe->data + s->PointerToRawData + (rva - start);
         }
     }
     return NULL;
+}
+
+/* Like rva_to_ptr, but for a NUL-terminated string: NULL unless the
+ * terminator is inside the file too. */
+static char *rva_to_str(PEFile *pe, uint32_t rva) {
+    char *s = (char *)rva_to_ptr(pe, rva, 1);
+    if (!s) return NULL;
+    size_t max = pe->size - (size_t)((uint8_t *)s - pe->data);
+    return memchr(s, 0, max) ? s : NULL;
 }
 
 static PEFile *pe_open(const char *path) {
@@ -39,11 +56,15 @@ static PEFile *pe_open(const char *path) {
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
+    if (sz < (long)sizeof(DosHeader)) {
+        fprintf(stderr, "not a PE: file too small\n");
+        fclose(f); return NULL;
+    }
 
     PEFile *pe = calloc(1, sizeof(PEFile));
     pe->size = (size_t)sz;
     pe->data = malloc(sz);
-    if (fread(pe->data, 1, sz, f) != (size_t)sz) {
+    if (!pe->data || fread(pe->data, 1, sz, f) != (size_t)sz) {
         fprintf(stderr, "short read\n");
         fclose(f); free(pe->data); free(pe); return NULL;
     }
@@ -56,7 +77,12 @@ static PEFile *pe_open(const char *path) {
         goto fail;
     }
 
-    /* PE signature "PE\0\0" at e_lfanew */
+    /* PE signature "PE\0\0" at e_lfanew, followed by the COFF header
+     * and at least the fixed part of the optional header. */
+    if (!in_file(pe, pe->dos->e_lfanew, 4 + sizeof(CoffHeader) + 2)) {
+        fprintf(stderr, "not a PE: e_lfanew out of range\n");
+        goto fail;
+    }
     uint32_t *sig = (uint32_t *)(pe->data + pe->dos->e_lfanew);
     if (*sig != 0x00004550) {
         fprintf(stderr, "not a PE: bad PE signature\n");
@@ -74,10 +100,31 @@ static PEFile *pe_open(const char *path) {
         fprintf(stderr, "not PE32+ (Magic=0x%x)\n", pe->opt->Magic);
         goto fail;
     }
+    /* We index DataDirectory[] directly, so require the full table. */
+    uint64_t opt_off = (uint8_t *)pe->opt - pe->data;
+    if (pe->coff->SizeOfOptionalHeader < sizeof(OptHeader64) ||
+        !in_file(pe, opt_off, sizeof(OptHeader64)) ||
+        pe->opt->NumberOfRvaAndSizes < NUM_DIRS) {
+        fprintf(stderr, "truncated optional header\n");
+        goto fail;
+    }
 
     /* Section table follows the optional header. */
-    pe->sections = (SectionHeader *)((uint8_t *)pe->opt +
-                                     pe->coff->SizeOfOptionalHeader);
+    uint64_t sec_off = opt_off + pe->coff->SizeOfOptionalHeader;
+    if (!in_file(pe, sec_off,
+                 (uint64_t)pe->coff->NumberOfSections * sizeof(SectionHeader))) {
+        fprintf(stderr, "section table out of range\n");
+        goto fail;
+    }
+    pe->sections = (SectionHeader *)(pe->data + sec_off);
+
+    for (int i = 0; i < pe->coff->NumberOfSections; i++) {
+        SectionHeader *s = &pe->sections[i];
+        if (!in_file(pe, s->PointerToRawData, s->SizeOfRawData)) {
+            fprintf(stderr, "section %d raw data out of range\n", i);
+            goto fail;
+        }
+    }
     return pe;
 
 fail:
@@ -110,9 +157,11 @@ static void pe_dump(PEFile *pe) {
         return;
     }
     printf("  Imports:\n");
-    ImportDescriptor *desc = (ImportDescriptor *)rva_to_ptr(pe, imp->VirtualAddress);
-    for (; desc && desc->Name; desc++) {
-        char *dll = (char *)rva_to_ptr(pe, desc->Name);
+    ImportDescriptor *desc;
+    for (uint32_t d_rva = imp->VirtualAddress;
+         (desc = (ImportDescriptor *)rva_to_ptr(pe, d_rva, sizeof(*desc))) && desc->Name;
+         d_rva += sizeof(*desc)) {
+        char *dll = rva_to_str(pe, desc->Name);
         printf("    %s\n", dll ? dll : "(?)");
 
         /* OriginalFirstThunk points at the import lookup table:
@@ -121,14 +170,16 @@ static void pe_dump(PEFile *pe) {
          * hint/name table entry (2-byte hint, then the name). */
         uint32_t thunk_rva = desc->OriginalFirstThunk
                            ? desc->OriginalFirstThunk : desc->FirstThunk;
-        uint64_t *thunk = (uint64_t *)rva_to_ptr(pe, thunk_rva);
-        for (; thunk && *thunk; thunk++) {
+        uint64_t *thunk;
+        for (; (thunk = (uint64_t *)rva_to_ptr(pe, thunk_rva, 8)) && *thunk;
+             thunk_rva += 8) {
             if (*thunk & 0x8000000000000000ULL) {
                 printf("        #%llu (ordinal)\n",
                        (unsigned long long)(*thunk & 0xFFFF));
             } else {
-                char *name = (char *)rva_to_ptr(pe, (uint32_t)*thunk) + 2;
-                printf("        %s\n", name);
+                /* skip the 2-byte hint to reach the name */
+                char *name = rva_to_str(pe, (uint32_t)*thunk + 2);
+                printf("        %s\n", name ? name : "(?)");
             }
         }
     }

@@ -8,7 +8,7 @@ CC      ?= cc
 CFLAGS  ?= -Wall -Wextra -g -O0
 MINGW   ?= x86_64-w64-mingw32-gcc
 
-all: parse loader test/hello.exe
+all: parse loader test/hello.exe test/reloc.exe
 
 # Step 1: the parser (standalone, for inspecting a .exe)
 parse: src/pe_parse.c src/pe.h
@@ -23,10 +23,18 @@ loader: src/loader.c src/pe_parse.c src/pe.h
 test/hello.exe: test/hello.c
 	$(MINGW) -nostdlib -e go -O0 -o $@ test/hello.c -lkernel32
 
+# Same, but with absolute pointers, so it carries DIR64 relocations.
+test/reloc.exe: test/reloc.c
+	$(MINGW) -nostdlib -e go -O0 -o $@ test/reloc.c -lkernel32
+
 run: all
 	./loader test/hello.exe
 
-clean:
-	rm -f parse loader test/hello.exe
+# Good images must run; malformed ones must be rejected cleanly.
+test: all
+	./test/check.sh
 
-.PHONY: all run clean
+clean:
+	rm -f parse loader test/*.exe
+
+.PHONY: all run test clean
