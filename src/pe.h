@@ -42,6 +42,7 @@ typedef struct {
 
 #define DIR_IMPORT     1
 #define DIR_BASERELOC  5
+#define DIR_TLS        9
 #define NUM_DIRS       16
 
 /* Optional header (PE32+ / 64-bit variant, Magic == 0x20B). */
@@ -111,6 +112,18 @@ typedef struct {
     uint32_t PageRVA;
     uint32_t BlockSize;
 } BaseRelocBlock;
+
+/* TLS directory (DataDirectory[DIR_TLS]). Unlike most of the PE, these
+ * are full virtual addresses, not RVAs, so base relocation fixes them
+ * up. The raw data is the initial image of every thread's TLS block. */
+typedef struct {
+    uint64_t StartAddressOfRawData;
+    uint64_t EndAddressOfRawData;
+    uint64_t AddressOfIndex;       /* where to store this module's slot */
+    uint64_t AddressOfCallBacks;   /* NULL-terminated array of VAs */
+    uint32_t SizeOfZeroFill;       /* zeroed bytes after the raw data */
+    uint32_t Characteristics;
+} TlsDirectory64;
 
 #define REL_ABSOLUTE 0
 #define REL_DIR64    10

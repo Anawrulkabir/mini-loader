@@ -25,6 +25,41 @@ if grep -q "relocated pointer 1" "$T/out" && grep -q "relocated pointer 2" "$T/o
    && [ $rc -eq 7 ]; then ok "reloc (DIR64 fixups, stderr, exit code)"
 else bad "reloc (exit $rc)"; fi
 
+./loader test/crt.exe a "b c" >"$T/out" 2>"$T/err"; rc=$?
+crt_ok=1
+for want in "argc=3 [a] [b c]" "constructor ran: yes" "TEB self pointer: yes" \
+            "stack within TEB bounds: yes" "PEB image base: yes" \
+            "thread id from TEB: yes" "last error in TEB: yes" "thread-local: 42" \
+            "heap works" "formats: -123456 1099511627776 3.14 wide abc" \
+            "atexit handler ran"; do
+    grep -qF "$want" "$T/out" || { echo "        missing: $want"; crt_ok=0; }
+done
+grep -q "to stderr" "$T/err" || { echo "        missing stderr line"; crt_ok=0; }
+if [ $crt_ok -eq 1 ] && [ $rc -eq 3 ]; then ok "crt (CRT startup, TEB, argv, atexit, printf)"
+else bad "crt (exit $rc)"; fi
+
+# Native TLS needs a compiler that emits it; mingw gcc doesn't. Linked
+# without relocations, so it also covers loading at ImageBase.
+if command -v clang >/dev/null 2>&1 && \
+   clang --target=x86_64-w64-windows-gnu -fno-emulated-tls \
+         -isystem /usr/x86_64-w64-mingw32/include -D__USE_MINGW_ANSI_STDIO=0 \
+         -O1 -c -o "$T/tls.o" test/tls.c 2>/dev/null && \
+   ${MINGW:-x86_64-w64-mingw32-gcc} -Wl,--disable-dynamicbase,--disable-reloc-section \
+         -o "$T/tls.bin" "$T/tls.o" 2>/dev/null; then
+    out=$(./loader "$T/tls.bin" 2>&1); rc=$?
+    case "$out" in
+    *"native tls 8 2"*)
+        [ $rc -eq 0 ] && ok "tls (gs:[0x58], stripped relocs)" || bad "tls (exit $rc)";;
+    *"can't be loaded at"*)
+        # Something else owns ImageBase in this process (ASan's shadow
+        # memory does); refusing is the right answer, but untested.
+        echo "  skip  tls (ImageBase not available in this process)";;
+    *)  bad "tls (output)";;
+    esac
+else
+    echo "  skip  tls (needs clang that can target x86_64-w64-windows-gnu)"
+fi
+
 echo "== malformed images =="
 
 if ! command -v python3 >/dev/null 2>&1; then
@@ -37,6 +72,7 @@ import struct, sys
 out = sys.argv[1]
 hello = open("test/hello.exe", "rb").read()
 reloc = open("test/reloc.exe", "rb").read()
+crt   = open("test/crt.exe", "rb").read()
 
 def put(name, data): open(f"{out}/{name}.exe", "wb").write(data)
 
@@ -86,6 +122,17 @@ d = bytearray(hello); i = d.index(b"WriteFile\0"); d[i:i+9] = b"WriteFilX"; put(
 # import directory pointing outside the image
 d = bytearray(hello); lf, opt, _ = layout(d)
 struct.pack_into("<I", d, opt + 112 + 8 * 1, 0x7FFF0000); put("bad_import_dir", d)
+
+# TLS directory pointing outside the image
+d = bytearray(crt); lf, opt, _ = layout(d)
+struct.pack_into("<I", d, opt + 112 + 8 * 9, 0x7FFF0000); put("bad_tls_dir", d)
+
+# a TLS callback that points outside the image
+d = bytearray(crt); lf, opt, _ = layout(d)
+base = struct.unpack_from("<Q", d, opt + 24)[0]
+tls = rva_to_off(d, struct.unpack_from("<I", d, opt + 112 + 8 * 9)[0])
+cbs = struct.unpack_from("<Q", d, tls + 24)[0]
+struct.pack_into("<Q", d, rva_to_off(d, cbs - base), 0x7FFFFFFF0000); put("bad_tls_callback", d)
 PY
 
 # Run with a timeout where available, so a hang shows as a failure.
