@@ -45,11 +45,11 @@ static WINAPI void *my__onexit(WinFn *fn) {
     return (void *)fn;
 }
 
-/* msvcrt's exit runs the CRT's handlers; ExitProcess (kernel32) is
- * lower level and does not. */
-static WINAPI void my_exit(int code)           { run_onexit(); exit(code); }
+/* msvcrt's exit runs the CRT's handlers, then ExitProcess; that (in
+ * kernel32) detaches every DLL, newest first, and ends the process. */
+static WINAPI void my_ExitProcess(uint32_t c)  { shutdown_modules(); exit((int)c); }
+static WINAPI void my_exit(int code)           { run_onexit(); my_ExitProcess((uint32_t)code); }
 static WINAPI void my__cexit(void)             { run_onexit(); fflush(NULL); }
-static WINAPI void my_ExitProcess(uint32_t c)  { fflush(NULL); exit((int)c); }
 static WINAPI void my_abort(void)              { abort(); }
 static WINAPI void my__amsg_exit(int n) {
     fprintf(stderr, "runtime error R60%02d\n", n);
@@ -175,24 +175,17 @@ static long page_size(void) {
     return pg;
 }
 
-/* Set protection on [rva, rva+len) of the image, rounded out to pages.
+/* Set protection on [rva, rva+len) of module m, rounded out to pages.
  * The caller has checked the range is inside the image. */
-static int image_protect(Image *img, uint64_t rva, uint64_t len, uint32_t win) {
+static int image_protect(Module *m, uint64_t rva, uint64_t len, uint32_t win) {
     uint64_t pg    = (uint64_t)page_size();
     uint64_t first = rva / pg;
     uint64_t last  = (rva + len + pg - 1) / pg;   /* exclusive */
     if (last == first) return 0;
-    if (mprotect(img->base + first * pg, (last - first) * pg, host_prot(win)) != 0)
+    if (mprotect(m->base + first * pg, (last - first) * pg, host_prot(win)) != 0)
         return -1;
-    for (uint64_t p = first; p < last; p++) img->page_prot[p] = win;
+    for (uint64_t p = first; p < last; p++) m->page_prot[p] = win;
     return 0;
-}
-
-/* Map a pointer into the image to its page index, or -1. */
-static int64_t image_page(const void *addr) {
-    uintptr_t a = (uintptr_t)addr, b = (uintptr_t)g_img.base;
-    if (!g_img.base || a < b || a - b >= g_img.size) return -1;
-    return (int64_t)((a - b) / (uintptr_t)page_size());
 }
 
 /* MEMORY_BASIC_INFORMATION, x64 layout. */
@@ -211,35 +204,86 @@ _Static_assert(sizeof(MemoryBasicInformation) == 48, "MBI layout");
 #define MEM_COMMIT 0x1000
 #define MEM_IMAGE  0x1000000
 
-/* Describe the run of same-protection pages starting at addr's page. */
+/* Describe the run of same-protection pages starting at addr's page.
+ * We only know about the pages of loaded modules. */
 static WINAPI size_t my_VirtualQuery(const void *addr, MemoryBasicInformation *mbi,
                                      size_t len) {
-    int64_t p = image_page(addr);
-    if (p < 0 || len < sizeof(*mbi)) { set_last_error(87); return 0; }
-    uint64_t pg = (uint64_t)page_size(), npages = (g_img.size + pg - 1) / pg;
-    uint64_t q = (uint64_t)p;
-    while (q < npages && g_img.page_prot[q] == g_img.page_prot[p]) q++;
+    Module *m = module_from_addr(addr);
+    if (!m || len < sizeof(*mbi)) { set_last_error(87); return 0; }
+    uint64_t pg = (uint64_t)page_size(), npages = (m->size + pg - 1) / pg;
+    uint64_t p = (uint64_t)((const uint8_t *)addr - m->base) / pg, q = p;
+    while (q < npages && m->page_prot[q] == m->page_prot[p]) q++;
 
     memset(mbi, 0, sizeof(*mbi));
-    mbi->BaseAddress       = g_img.base + (uint64_t)p * pg;
-    mbi->AllocationBase    = g_img.base;
+    mbi->BaseAddress       = m->base + p * pg;
+    mbi->AllocationBase    = m->base;
     mbi->AllocationProtect = PAGE_EXECUTE_WRITECOPY;
-    mbi->RegionSize        = (q - (uint64_t)p) * pg;
+    mbi->RegionSize        = (q - p) * pg;
     mbi->State             = MEM_COMMIT;
-    mbi->Protect           = g_img.page_prot[p];
+    mbi->Protect           = m->page_prot[p];
     mbi->Type              = MEM_IMAGE;
     return sizeof(*mbi);
 }
 
 static WINAPI int my_VirtualProtect(void *addr, size_t len, uint32_t prot,
                                     uint32_t *old) {
-    int64_t p = image_page(addr);
-    if (p < 0 || !old) { set_last_error(487); return 0; }
-    uint64_t rva = (uint64_t)((uint8_t *)addr - g_img.base);
-    if (len > g_img.size - rva) { set_last_error(487); return 0; }
-    *old = g_img.page_prot[p];
-    if (image_protect(&g_img, rva, len, prot) != 0) { set_last_error(87); return 0; }
+    Module *m = module_from_addr(addr);
+    if (!m || !old) { set_last_error(487); return 0; }
+    uint64_t rva = (uint64_t)((uint8_t *)addr - m->base);
+    if (len > m->size - rva) { set_last_error(487); return 0; }
+    *old = m->page_prot[rva / (uint64_t)page_size()];
+    if (image_protect(m, rva, len, prot) != 0) { set_last_error(87); return 0; }
     return 1;
+}
+
+/* ---- modules: LoadLibrary and friends ------------------------------------ *
+ * An HMODULE is the module's base address (loader.c does the work). */
+
+#define ERROR_MOD_NOT_FOUND   126
+#define ERROR_PROC_NOT_FOUND  127
+
+static WINAPI void *my_LoadLibraryA(const char *name) {
+    Module *m = name ? load_library(name) : NULL;
+    if (!m) { set_last_error(ERROR_MOD_NOT_FOUND); return NULL; }
+    return m->base;
+}
+
+static WINAPI int my_FreeLibrary(void *h) {
+    return free_library(module_from_handle(h));
+}
+
+static WINAPI void *my_GetModuleHandleA(const char *name) {
+    if (!name) return g_exe->base;
+    Module *m = find_module(name);
+    if (!m) { set_last_error(ERROR_MOD_NOT_FOUND); return NULL; }
+    return m->base;
+}
+
+/* The name is an ordinal when it fits in the low 16 bits, as with
+ * MAKEINTRESOURCE. */
+static WINAPI void *my_GetProcAddress(void *h, const char *name) {
+    Module *m = module_from_handle(h);
+    void *fn = NULL;
+    if (m) {
+        uintptr_t n = (uintptr_t)name;
+        fn = n >> 16 ? module_export(m, name, 0, 0)
+                     : module_export(m, NULL, (uint32_t)n, 0);
+    }
+    if (!fn) set_last_error(m ? ERROR_PROC_NOT_FOUND : ERROR_MOD_NOT_FOUND);
+    return fn;
+}
+
+static WINAPI uint32_t my_GetModuleFileNameA(void *h, char *buf, uint32_t size) {
+    Module *m = h ? module_from_handle(h) : g_exe;
+    if (!m || !size) { set_last_error(ERROR_MOD_NOT_FOUND); return 0; }
+    char tmp[4096];
+    if (m->path) snprintf(tmp, sizeof tmp, "%s", m->path);
+    else         snprintf(tmp, sizeof tmp, "C:\\windows\\system32\\%s", m->name);
+    size_t n = strlen(tmp);
+    if (n >= size) n = size - 1;   /* truncated, as Windows does */
+    memcpy(buf, tmp, n);
+    buf[n] = 0;
+    return (uint32_t)n;
 }
 
 /* ---- console handles ------------------------------------------------------ */
@@ -502,22 +546,27 @@ static WINAPI char  *my_strcpy(char *d, const char *s)     { return strcpy(d, s)
 
 /* ---- the import table ----------------------------------------------------- */
 
-/* Import name -> our stub (or, for data imports, our variable). A real
- * loader would load the actual DLL and look each name up in its export
- * table; we resolve against this list, whichever DLL the name is from. */
+/* Import name -> our stub (or, for data imports, our variable). This is
+ * the export table of every builtin DLL at once: we don't check which
+ * DLL a name came from. */
 typedef struct { const char *name; void *fn; } Stub;
 static Stub g_stubs[] = {
     /* kernel32 */
     { "DeleteCriticalSection",       (void *)my_DeleteCriticalSection },
     { "EnterCriticalSection",        (void *)my_EnterCriticalSection },
     { "ExitProcess",                 (void *)my_ExitProcess },
+    { "FreeLibrary",                 (void *)my_FreeLibrary },
     { "GetCurrentProcessId",         (void *)my_GetCurrentProcessId },
     { "GetCurrentThreadId",          (void *)my_GetCurrentThreadId },
     { "GetLastError",                (void *)my_GetLastError },
+    { "GetModuleFileNameA",          (void *)my_GetModuleFileNameA },
+    { "GetModuleHandleA",            (void *)my_GetModuleHandleA },
+    { "GetProcAddress",              (void *)my_GetProcAddress },
     { "GetStdHandle",                (void *)my_GetStdHandle },
     { "InitializeCriticalSection",   (void *)my_InitializeCriticalSection },
     { "IsDBCSLeadByteEx",            (void *)my_IsDBCSLeadByteEx },
     { "LeaveCriticalSection",        (void *)my_LeaveCriticalSection },
+    { "LoadLibraryA",                (void *)my_LoadLibraryA },
     { "MultiByteToWideChar",         (void *)my_MultiByteToWideChar },
     { "SetLastError",                (void *)my_SetLastError },
     { "SetUnhandledExceptionFilter", (void *)my_SetUnhandledExceptionFilter },
@@ -582,9 +631,10 @@ static Stub g_stubs[] = {
     { NULL, NULL }
 };
 
-static void *resolve_stub(const char *name) {
+/* Our stand-in for a builtin DLL's export table; NULL if we have no
+ * such function, which the loader reports by name. */
+static void *find_stub(const char *name) {
     for (Stub *s = g_stubs; s->name; s++)
         if (strcmp(s->name, name) == 0) return s->fn;
-    fprintf(stderr, "  [unresolved import: %s]\n", name);
-    return NULL;  /* load_image refuses to run the image if any are NULL */
+    return NULL;
 }

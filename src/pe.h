@@ -33,6 +33,7 @@ typedef struct {
 } CoffHeader;
 
 #define FILE_RELOCS_STRIPPED 0x0001  /* CoffHeader.Characteristics */
+#define FILE_DLL             0x2000
 
 /* One entry in the data directory (imports, relocations, etc.). */
 typedef struct {
@@ -40,6 +41,7 @@ typedef struct {
     uint32_t Size;
 } DataDirectory;
 
+#define DIR_EXPORT     0
 #define DIR_IMPORT     1
 #define DIR_BASERELOC  5
 #define DIR_TLS        9
@@ -96,6 +98,26 @@ typedef struct {
 #define SCN_MEM_EXECUTE 0x20000000
 #define SCN_MEM_READ    0x40000000
 #define SCN_MEM_WRITE   0x80000000
+
+/* Export directory — what a DLL offers. Functions are found by ordinal
+ * (Base + index into AddressOfFunctions), and names map to ordinals
+ * through two parallel arrays: AddressOfNames[i] is a name, and
+ * AddressOfNameOrdinals[i] the index its function is at. An exported
+ * RVA that points back inside this directory isn't code but a
+ * forwarder string, "OTHERDLL.Function" or "OTHERDLL.#12". */
+typedef struct {
+    uint32_t Characteristics;
+    uint32_t TimeDateStamp;
+    uint16_t MajorVersion;
+    uint16_t MinorVersion;
+    uint32_t Name;                  /* RVA of the DLL's own name */
+    uint32_t Base;                  /* ordinal of AddressOfFunctions[0] */
+    uint32_t NumberOfFunctions;
+    uint32_t NumberOfNames;
+    uint32_t AddressOfFunctions;    /* RVA of uint32_t[NumberOfFunctions] */
+    uint32_t AddressOfNames;        /* RVA of uint32_t[NumberOfNames] */
+    uint32_t AddressOfNameOrdinals; /* RVA of uint16_t[NumberOfNames] */
+} ExportDirectory;
 
 /* Import directory entry — one per imported DLL. */
 typedef struct {

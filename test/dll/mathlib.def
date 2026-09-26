@@ -1,0 +1,11 @@
+; Exports of mathlib.dll. `mul` has no name in the export table at all,
+; only ordinal 7, so importers must bind it by number. `forty_two` is a
+; forwarder: the loader must follow it into base.dll.
+LIBRARY mathlib.dll
+EXPORTS
+    add            @1
+    greet          @2
+    magic          @3
+    mathlib_calls  @4 DATA
+    mul            @7 NONAME
+    forty_two = base.base_value @8

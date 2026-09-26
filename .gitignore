@@ -1,3 +1,5 @@
 parse
 loader
 test/*.exe
+test/*.dll
+test/*.a

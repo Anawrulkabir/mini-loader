@@ -7,8 +7,10 @@
 CC      ?= cc
 CFLAGS  ?= -Wall -Wextra -g -O0
 MINGW   ?= x86_64-w64-mingw32-gcc
+DLLTOOL ?= x86_64-w64-mingw32-dlltool
 
-all: parse loader test/hello.exe test/reloc.exe test/crt.exe
+all: parse loader test/hello.exe test/reloc.exe test/crt.exe \
+     test/dlltest.exe test/plugin.dll
 
 # Step 1: the parser (standalone, for inspecting a .exe)
 parse: src/pe_parse.c src/pe.h
@@ -32,6 +34,24 @@ test/reloc.exe: test/reloc.c
 test/crt.exe: test/crt.c
 	$(MINGW) -O1 -D__USE_MINGW_ANSI_STDIO=0 -o $@ test/crt.c
 
+# DLLs: dlltest.exe -> mathlib.dll -> base.dll, plus plugin.dll loaded
+# at run time. mathlib's import library comes from its .def file, so
+# that `mul` (exported by ordinal only) is imported by ordinal.
+test/base.dll: test/dll/base.c
+	$(MINGW) -shared -O1 -o $@ test/dll/base.c
+
+test/libmathlib.a: test/dll/mathlib.def
+	$(DLLTOOL) -d test/dll/mathlib.def -l $@ -D mathlib.dll
+
+test/mathlib.dll: test/dll/mathlib.c test/dll/mathlib.def test/base.dll
+	$(MINGW) -shared -O1 -o $@ test/dll/mathlib.c test/dll/mathlib.def test/base.dll
+
+test/plugin.dll: test/dll/plugin.c
+	$(MINGW) -shared -O1 -o $@ test/dll/plugin.c
+
+test/dlltest.exe: test/dlltest.c test/libmathlib.a test/mathlib.dll
+	$(MINGW) -O1 -o $@ test/dlltest.c -Ltest -lmathlib
+
 run: all
 	./loader test/hello.exe
 
@@ -40,6 +60,6 @@ test: all
 	./test/check.sh
 
 clean:
-	rm -f parse loader test/*.exe
+	rm -f parse loader test/*.exe test/*.dll test/*.a
 
 .PHONY: all run test clean

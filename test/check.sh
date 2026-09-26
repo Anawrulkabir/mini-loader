@@ -38,6 +38,40 @@ grep -q "to stderr" "$T/err" || { echo "        missing stderr line"; crt_ok=0; 
 if [ $crt_ok -eq 1 ] && [ $rc -eq 3 ]; then ok "crt (CRT startup, TEB, argv, atexit, printf)"
 else bad "crt (exit $rc)"; fi
 
+# Real DLLs: the output must match exactly, since the order of the
+# attach/detach lines is part of what's being tested.
+./loader test/dlltest.exe 2>"$T/err" | sed -n '/^== loaded/,$p' | grep -v '^== ' >"$T/out"
+rc=$?
+cat >"$T/want" <<'WANT'
+base.dll: attach
+mathlib.dll: attach (static)
+
+main: start
+greet: hello from mathlib.dll
+add(2, 3) = 5
+mul(6, 7) = 42 (by ordinal)
+magic() = 43 (via base.dll)
+forty_two() = 42 (forwarded)
+mathlib_calls = 2 (data export)
+GetModuleHandle(mathlib) matches LoadLibrary: yes
+GetProcAddress(#7)(3, 4) = 12
+GetProcAddress(nope) is NULL: yes
+plugin.dll: attach
+plugin says: demo plugin
+plugin.dll: detach
+FreeLibrary(plugin): ok
+LoadLibrary(missing.dll) is NULL: yes
+module file name ends with dlltest.exe: yes
+main: end
+mathlib.dll: detach
+base.dll: detach
+WANT
+if diff "$T/want" "$T/out" >"$T/diff" && [ $rc -eq 0 ]; then
+    ok "dlls (load order, ordinals, forwarders, data, LoadLibrary, detach)"
+else
+    bad "dlls (exit $rc)"; sed 's/^/        /' "$T/diff"
+fi
+
 # Native TLS needs a compiler that emits it; mingw gcc doesn't. Linked
 # without relocations, so it also covers loading at ImageBase.
 if command -v clang >/dev/null 2>&1 && \
@@ -133,13 +167,55 @@ base = struct.unpack_from("<Q", d, opt + 24)[0]
 tls = rva_to_off(d, struct.unpack_from("<I", d, opt + 112 + 8 * 9)[0])
 cbs = struct.unpack_from("<Q", d, tls + 24)[0]
 struct.pack_into("<Q", d, rva_to_off(d, cbs - base), 0x7FFFFFFF0000); put("bad_tls_callback", d)
+
+# DLL cases: each gets its own directory with the exe and its DLLs, so
+# the loader finds the (possibly broken) copies next to the exe.
+import os, shutil
+def dll_case(name, mutate):
+    d = f"{out}/{name}"; os.mkdir(d)
+    for f in ("dlltest.exe", "mathlib.dll", "base.dll", "plugin.dll"):
+        shutil.copy(f"test/{f}", d)
+    mutate(d)
+
+def patch(path, fn):
+    d = bytearray(open(path, "rb").read()); fn(d); open(path, "wb").write(d)
+
+# a DLL the exe imports doesn't exist
+dll_case("missing_dll", lambda d: os.remove(f"{d}/mathlib.dll"))
+
+# export directory pointing outside the DLL
+def bad_exports(d):
+    def f(b):
+        lf, opt, _ = layout(b)
+        struct.pack_into("<I", b, opt + 112, 0x7FFF0000)
+    patch(f"{d}/mathlib.dll", f)
+dll_case("bad_export_dir", bad_exports)
+
+# a forwarder back to itself: mathlib.forty_two -> mathlib.#8 (itself)
+def fwd_loop(d):
+    def f(b):
+        i = b.index(b"base.base_value\0")
+        b[i:i+16] = b"mathlib.#8\0".ljust(16, b"\0")
+    patch(f"{d}/mathlib.dll", f)
+dll_case("forwarder_loop", fwd_loop)
+
+# DllMain returns FALSE: turn base.dll's "return TRUE" into FALSE by
+# making its entry point return 0 immediately (xor eax,eax; ret)
+def dllmain_fails(d):
+    def f(b):
+        lf, opt, _ = layout(b)
+        entry = struct.unpack_from("<I", b, opt + 16)[0]
+        o = rva_to_off(b, entry); b[o:o+3] = b"\x31\xc0\xc3"
+    patch(f"{d}/base.dll", f)
+dll_case("dllmain_fails", dllmain_fails)
 PY
 
 # Run with a timeout where available, so a hang shows as a failure.
 TO=""; command -v timeout >/dev/null 2>&1 && TO="timeout 5"
 
-for f in "$T"/*.exe; do
+for f in "$T"/*.exe "$T"/*/dlltest.exe; do
     name=$(basename "$f" .exe)
+    [ "$name" = dlltest ] && name=$(basename "$(dirname "$f")")
 
     # parse only dumps headers: it may accept an image that can't load,
     # but must never crash on one. (124 = timeout, >128 = signal.)

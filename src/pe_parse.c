@@ -150,6 +150,30 @@ static void pe_dump(PEFile *pe) {
                (s->Characteristics & SCN_MEM_EXECUTE) ? 'x' : '-');
     }
 
+    /* Exports, if this is a DLL: ordinal, then name or "(no name)". */
+    DataDirectory *exp = &pe->opt->DataDirectory[DIR_EXPORT];
+    ExportDirectory *ed = exp->VirtualAddress
+        ? (ExportDirectory *)rva_to_ptr(pe, exp->VirtualAddress, sizeof(*ed)) : NULL;
+    if (ed) {
+        char *self = rva_to_str(pe, ed->Name);
+        printf("  Exports          %s\n", self ? self : "(?)");
+        for (uint32_t i = 0; i < ed->NumberOfFunctions && i < 4096; i++) {
+            uint32_t *fn = (uint32_t *)rva_to_ptr(pe, ed->AddressOfFunctions + 4 * i, 4);
+            if (!fn) break;
+            if (!*fn) continue;               /* unused ordinal */
+            const char *name = "(no name)";
+            for (uint32_t j = 0; j < ed->NumberOfNames && j < 4096; j++) {
+                uint16_t *o = (uint16_t *)rva_to_ptr(pe, ed->AddressOfNameOrdinals + 2 * j, 2);
+                uint32_t *n = (uint32_t *)rva_to_ptr(pe, ed->AddressOfNames + 4 * j, 4);
+                if (o && n && *o == i) { char *s = rva_to_str(pe, *n); if (s) name = s; break; }
+            }
+            int fwd = *fn >= exp->VirtualAddress && *fn - exp->VirtualAddress < exp->Size;
+            char *target = fwd ? rva_to_str(pe, *fn) : NULL;
+            printf("        #%-4u %s%s%s\n", ed->Base + i, name,
+                   fwd ? " -> " : "", fwd ? (target ? target : "(?)") : "");
+        }
+    }
+
     /* Walk the import directory and list DLLs + named functions. */
     DataDirectory *imp = &pe->opt->DataDirectory[DIR_IMPORT];
     if (imp->VirtualAddress == 0) {
